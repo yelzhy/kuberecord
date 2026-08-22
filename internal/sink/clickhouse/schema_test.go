@@ -81,6 +81,30 @@ func fullSchemaRows() [][3]string {
 	return rows
 }
 
+// The one column the drift fixtures mangle, and what they mangle it to.
+//
+// A single wrong type on a single column is the smallest drift validateSchema
+// must still catch, and the one the frozen schema's additive-only policy cannot
+// excuse — an extra column is tolerated, a changed one is not. Every test that
+// needs an invalid schema uses this same drift rather than inventing its own, so
+// "the schema is wrong" means one thing across the package.
+const (
+	driftedColumn = "sha256"
+	driftedType   = "FixedString(64)"
+)
+
+// driftedSchemaRows returns system.columns rows matching requiredColumns except
+// for driftedColumn on resource_states, whose reported type is wrong.
+func driftedSchemaRows() [][3]string {
+	rows := fullSchemaRows()
+	for i := range rows {
+		if rows[i][0] == tableResourceStates && rows[i][1] == driftedColumn {
+			rows[i][2] = driftedType
+		}
+	}
+	return rows
+}
+
 func TestValidateSchema(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -110,18 +134,10 @@ func TestValidateSchema(t *testing.T) {
 			wantInError: []string{tableResourceStates, "actors"},
 		},
 		{
-			name: "type mismatch names the column and both types",
-			rows: func() [][3]string {
-				out := fullSchemaRows()
-				for i := range out {
-					if out[i][0] == tableResourceStates && out[i][1] == "sha256" {
-						out[i][2] = "FixedString(64)" // wrong type
-					}
-				}
-				return out
-			}(),
+			name:        "type mismatch names the column and both types",
+			rows:        driftedSchemaRows(),
 			wantErr:     true,
-			wantInError: []string{tableResourceStates, "sha256", "FixedString(64)", "String"},
+			wantInError: []string{tableResourceStates, driftedColumn, driftedType, "String"},
 		},
 		{
 			// Forward compatibility, per the frozen schema's additive-only

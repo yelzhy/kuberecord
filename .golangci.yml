@@ -50,6 +50,24 @@ linters:
           deny:
             - pkg: github.com/ClickHouse/clickhouse-go/v2
               desc: "the data plane and control plane must depend on internal/sink, not the ClickHouse driver (Task 0.5)"
+
+        # Task 5.1 acceptance criterion: the Writer conformance suite is built
+        # around the contract in internal/sink, not around any backend's
+        # implementation of it. internal/pipeline is denied because it imports
+        # internal/sink (so the dependency can only run one way, and a test
+        # binary reaching back would be an import cycle waiting to happen), and
+        # the ClickHouse packages because a suite that quietly certified one
+        # backend against another's behaviour would gate nothing (D11).
+        conformance-suite-is-backend-agnostic:
+          files:
+            - "**/internal/sink/conformance/**"
+          deny:
+            - pkg: github.com/yelzhy/kuberecord/internal/pipeline
+              desc: "the conformance suite must depend only on the sink contract; internal/sink cannot import internal/pipeline (Task 5.1)"
+            - pkg: github.com/yelzhy/kuberecord/internal/sink/clickhouse
+              desc: "the conformance suite must name no backend: it is the contract every backend is measured against (Task 5.1)"
+            - pkg: github.com/ClickHouse/clickhouse-go/v2
+              desc: "the conformance suite must name no backend: it is the contract every backend is measured against (Task 5.1)"
     custom:
       logcheck:
         type: "module"

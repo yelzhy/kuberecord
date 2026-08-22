@@ -14,6 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// The ClickHouse-specific half of this backend's write-path tests. The properties
+// every sink.Writer must uphold — commit-exactly-once on all four settling paths,
+// no lost jobs, drain before close, a bounded Enqueue, and a replay that collapses
+// to one logical record — are asserted by the shared suite instead, from
+// writer_conformance_test.go, whose header comment is the inventory of which
+// assertion belongs where.
+//
+// Task 0.7's lettered batching ACs are still traceable: (a)–(d) live below, while
+// (d)'s "flushes before conn.Close" half became the suite's DrainOrdering, (e) the
+// concurrent-Enqueue storm became ConcurrentEnqueueStorm, and (f) cancel-mid-batch
+// became ExactlyOnceCommit/ContextCancelledMidFlight. They are gone from this file
+// because they are contract obligations, not ClickHouse behaviour.
+
 package clickhouse
 
 import (
@@ -34,10 +47,6 @@ import (
 	"github.com/yelzhy/kuberecord/internal/pipeline"
 	"github.com/yelzhy/kuberecord/internal/sink"
 )
-
-// nameArgIndex is the position of Record.Name in the positional args produced by
-// insertArgs; the fakes use it to identify a specific "poison" row.
-const nameArgIndex = 7
 
 // testSinkName is the sink every writer built by these tests reports its
 // write-path metrics under (Task 1.8 made those series per-sink). The value is
@@ -96,6 +105,17 @@ type fakeConn struct {
 	sendErr func(ctx context.Context, rows [][]any) error
 	rowErr  func(ctx context.Context, args []any) error
 
+	// batchErr, if set, decides the outcome of *every* Send and is additionally
+	// told which statement the batch was prepared with. It takes precedence over
+	// sendErr and rowErr.
+	//
+	// It exists for the conformance harness, which drives both insert paths
+	// through a single backend stand-in: resource_states rows and watch_scopes
+	// rows are fifteen and eight positional args with no self-description, so
+	// without the statement the stand-in would have to guess which it was decoding
+	// — and a wrong guess is a mis-decoded row that reads as a mangled record.
+	batchErr func(ctx context.Context, query string, rows [][]any) error
+
 	// queryMu guards batchQueries, which records the statement each PrepareBatch
 	// was called with. The scope-event tests use it to prove their rows target
 	// watch_scopes rather than the record path's resource_states.
@@ -107,7 +127,7 @@ func (c *fakeConn) PrepareBatch(ctx context.Context, query string, _ ...driver.P
 	c.queryMu.Lock()
 	c.batchQueries = append(c.batchQueries, query)
 	c.queryMu.Unlock()
-	return &fakeBatch{conn: c, ctx: ctx}, nil
+	return &fakeBatch{conn: c, ctx: ctx, query: query}, nil
 }
 
 // preparedQueries returns the statements PrepareBatch has been called with.
@@ -138,7 +158,10 @@ type fakeBatch struct {
 
 	conn *fakeConn
 	ctx  context.Context
-	rows [][]any
+	// query is the statement this batch was prepared with, carried so batchErr can
+	// tell resource_states rows from watch_scopes ones.
+	query string
+	rows  [][]any
 }
 
 func (b *fakeBatch) Append(v ...any) error {
@@ -149,6 +172,9 @@ func (b *fakeBatch) Append(v ...any) error {
 func (b *fakeBatch) Send() error {
 	b.conn.sendCount.Add(1)
 	b.conn.lastSend.Store(b.conn.seq.Add(1))
+	if b.conn.batchErr != nil {
+		return b.conn.batchErr(b.ctx, b.query, b.rows)
+	}
 	if len(b.rows) == 1 && b.conn.rowErr != nil {
 		return b.conn.rowErr(b.ctx, b.rows[0])
 	}
@@ -267,11 +293,11 @@ func TestBatchFlushBoundsSendCalls(t *testing.T) {
 		t.Fatalf("Start returned error: %v", err)
 	}
 
+	// Every job settling is the precondition for the flush bound below, not a claim
+	// about the commit contract: exactly-once is the suite's property, and
+	// re-asserting it here would be the duplication Task 5.2 removes.
 	if total, trues, _ := log.counts(); total != jobs || trues != jobs {
 		t.Fatalf("commits: total=%d trues=%d, want %d/%d", total, trues, jobs, jobs)
-	}
-	if n := log.maxPerName(); n != 1 {
-		t.Fatalf("a job committed %d times, want exactly 1", n)
 	}
 	bound := int64((jobs+batchMaxRows-1)/batchMaxRows + workers)
 	if got := conn.sendCount.Load(); got > bound {
@@ -289,7 +315,7 @@ func TestPoisonRowIsolation(t *testing.T) {
 		sendErr: func(context.Context, [][]any) error { return errors.New("batch rejected") },
 		// Only the poison row fails its individual attempt.
 		rowErr: func(_ context.Context, args []any) error {
-			if len(args) > nameArgIndex && args[nameArgIndex] == "poison" {
+			if len(args) > nameArg && args[nameArg] == "poison" {
 				return errors.New("bad row")
 			}
 			return nil
@@ -317,9 +343,6 @@ func TestPoisonRowIsolation(t *testing.T) {
 	total, trues, falses := log.counts()
 	if total != batchMaxRows || trues != 9 || falses != 1 {
 		t.Fatalf("commits: total=%d trues=%d falses=%d, want 10/9/1", total, trues, falses)
-	}
-	if n := log.maxPerName(); n != 1 {
-		t.Fatalf("a job committed %d times, want exactly 1", n)
 	}
 	if v := writesTotalValue(t, reg, "failed"); v != 1 {
 		t.Fatalf("writes_total{failed} = %v, want 1", v)
@@ -382,9 +405,14 @@ func TestLoneJobFlushesOnWait(t *testing.T) {
 	}
 }
 
-// TestShutdownFlushesPartialBatch covers AC (d): a half-full batch left in a
-// worker at shutdown is flushed during the drain window, and that flush's Send
-// happens strictly before conn.Close.
+// TestShutdownFlushesPartialBatch is the batching half of AC (d): a half-full
+// batch is held — no Send at all — until shutdown, and the drain then flushes it
+// as one batch rather than row by row.
+//
+// What this test used to also assert is now the suite's: that the drain settles
+// those jobs (ExactlyOnceCommit/Drain) and that the flush precedes the
+// connection's closure (DrainOrdering). What is left is the claim the contract is
+// silent about — how many Sends this writer's batching produces.
 func TestShutdownFlushesPartialBatch(t *testing.T) {
 	conn := &fakeConn{} // healthy
 
@@ -414,112 +442,19 @@ func TestShutdownFlushesPartialBatch(t *testing.T) {
 		t.Fatalf("Start returned error: %v", err)
 	}
 
-	if total, trues, _ := log.counts(); total != partial || trues != partial {
-		t.Fatalf("commits: total=%d trues=%d, want %d/%d", total, trues, partial, partial)
-	}
 	if got := conn.sendCount.Load(); got != 1 {
-		t.Fatalf("Send calls = %d, want 1 (the drained partial batch)", got)
-	}
-	if send, close := conn.lastSend.Load(), conn.closeSeq.Load(); send == 0 || send >= close {
-		t.Fatalf("drain flush ordering: lastSend=%d closeSeq=%d, want 0 < send < close", send, close)
+		t.Fatalf("Send calls = %d, want 1 (the held partial batch, drained as a single batch)", got)
 	}
 }
 
-// TestConcurrentEnqueueStorm covers AC (e): many goroutines enqueuing at once
-// settle cleanly with every job committed exactly once. Run under -race to
-// exercise the batching worker's concurrency.
-func TestConcurrentEnqueueStorm(t *testing.T) {
-	const producers, perProducer = 20, 50
-	const jobs = producers * perProducer
-	conn := &fakeConn{} // healthy
-
-	reg := prometheus.NewRegistry()
-	m := pipeline.NewPipelineMetrics(reg).ForSink(testSinkID)
-	w := NewCHWriter(conn, jobs, 4, 10, 5*time.Millisecond, time.Second, time.Second, 20*time.Millisecond, time.Second, m)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- w.Start(ctx) }()
-
-	log := newCommitLog()
-	var wg sync.WaitGroup
-	for p := range producers {
-		wg.Go(func() {
-			for i := range perProducer {
-				enqueueNamed(t, w, ctx, log, "p"+strconv.Itoa(p)+"-"+strconv.Itoa(i))
-			}
-		})
-	}
-	wg.Wait()
-
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("Start returned error: %v", err)
-	}
-
-	if total, trues, _ := log.counts(); total != jobs || trues != jobs {
-		t.Fatalf("commits: total=%d trues=%d, want %d/%d", total, trues, jobs, jobs)
-	}
-	if n := log.maxPerName(); n != 1 {
-		t.Fatalf("a job committed %d times, want exactly 1", n)
-	}
-}
-
-// TestCancelMidBatchCommitsOnce covers AC (f): cancelling the context while a
-// batch's Send is in flight settles every job exactly once (never twice),
-// proven by an atomic per-job commit counter.
-func TestCancelMidBatchCommitsOnce(t *testing.T) {
-	const batchMaxRows = 5
-	conn := &fakeConn{
-		// Send blocks until the batch context is cancelled, then fails — this is
-		// the "in flight when shutdown begins" moment.
-		sendErr: func(ctx context.Context, _ [][]any) error {
-			<-ctx.Done()
-			return ctx.Err()
-		},
-		// The isolation attempt that follows also fails under the cancelled context.
-		rowErr: func(ctx context.Context, _ []any) error { return ctx.Err() },
-	}
-
-	reg := prometheus.NewRegistry()
-	m := pipeline.NewPipelineMetrics(reg).ForSink(testSinkID)
-	w := NewCHWriter(conn, 100, 1, batchMaxRows, time.Second, time.Second, time.Second, 30*time.Second, time.Second, m)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- w.Start(ctx) }()
-
-	// Instrument exactly-once with an atomic counter per job, independent of the
-	// commitLog, so a double-fire is caught even under -race.
-	var commits [batchMaxRows]atomic.Int64
-	for i := range batchMaxRows {
-		idx := i
-		if err := w.Enqueue(ctx, sink.Job{
-			Record: sink.Record{Name: "c" + strconv.Itoa(idx)},
-			Commit: func(bool) { commits[idx].Add(1) },
-		}); err != nil {
-			t.Fatalf("Enqueue: %v", err)
-		}
-	}
-
-	// Let the batch form and its Send block, then cancel mid-flight.
-	time.Sleep(50 * time.Millisecond)
-	cancel()
-
-	if err := <-done; err != nil {
-		t.Fatalf("Start returned error: %v", err)
-	}
-
-	for i := range batchMaxRows {
-		if got := commits[i].Load(); got != 1 {
-			t.Fatalf("job %d commit callback fired %d times, want exactly 1", i, got)
-		}
-	}
-}
-
-// TestWritesTotalFailedIncrements asserts that a job whose write can never
-// succeed (a permanently-erroring conn) settles as exactly one
-// writes_total{outcome="failed"}.
+// TestWritesTotalFailedIncrements is the metrics half of the permanently-failing
+// path: a job whose write can never succeed (a permanently-erroring conn) accounts
+// for exactly one writes_total{outcome="failed"} and no success.
+//
+// That such a job settles false exactly once is the suite's property
+// (ExactlyOnceCommit/PermanentFailure); the suite observes commit callbacks and is
+// blind to metrics, so the per-outcome accounting stays here. The commit outcome is
+// still read below, because it is what proves the counter has settled.
 func TestWritesTotalFailedIncrements(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := pipeline.NewPipelineMetrics(reg).ForSink(testSinkID)

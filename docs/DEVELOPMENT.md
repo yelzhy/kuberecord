@@ -52,6 +52,57 @@ sink.
 Anything touching goroutines, mutexes or channels carries a `-race` test, and
 long-lived goroutines carry a `goleak`-style shutdown test.
 
+### The sink conformance suite
+
+`internal/sink/conformance` holds the properties every `sink.Writer` must uphold
+— commit-exactly-once on all four settling paths, no lost jobs, drain before
+close, a bounded `Enqueue`, and a replay that collapses to one logical record —
+written against the contract in `internal/sink` and against no backend in
+particular. A new backend adopts it from its own test package by calling
+`conformance.RunWriterSuite` with a `Harness` describing how to observe it, how
+to make one of its writes fail, and how it deduplicates a record written twice.
+The suite is tested in both directions: it passes a compliant in-memory writer
+and is proven to *fail*, property by property, against writers built to violate
+each obligation.
+
+ClickHouse is its first adopter: `internal/sink/clickhouse/writer_conformance_test.go`
+holds the harness (and nothing else — every assertion is the suite's), and its
+header comment is the inventory of which claims come from the suite and which are
+backend-specific, so a new assertion has one obvious home. What stays in
+`writer_test.go` is what the contract is silent about: batching bounds, poison-row
+isolation, the isolation-phase budget, metrics accounting, and timestamp binding.
+
+#### The optional halves
+
+`sink.StateReader`, `sink.ScopeEventWriter` and `sink.Prober` are optional and
+duck-typed by the `SinkManager`, so the suite duck-types them too: `RunWriterSuite`
+type-asserts the `Harness`'s `Writer` and runs `RunStateReaderSuite`,
+`RunScopeEventWriterSuite` and `RunProberSuite` for whichever halves it satisfies.
+A backend that omits one is **skipped, never failed** — a `Writer`-only archive
+tier is a legitimate design (D12) — but the skip names the interface, lists the
+properties that consequently certify nothing, and states what the runtime turns
+off, because a silent skip is indistinguishable from a pass.
+
+Three `Harness` fields serve those halves and are required only when the
+corresponding interface is implemented: `ScopeWrites` (the ordered log of recorded
+transitions), `SetReadFault` (break a read part-way through — the only way to
+produce the partial read the contract forbids reporting as a short success), and
+`SetProbeOutcome` (arrange a healthy, schema-drifted or unreachable backend, since
+"your schema is wrong" is a state only the backend can construct).
+
+Two things the suite deliberately does *not* claim. It cannot assert "one `Started`
+per first-interest transition, never one per rule": that collapsing is
+`watch.ScopeEpochRecorder`'s, proven by
+`TestScopeEpochRecorderTransitionSemantics`, and a `ScopeEventWriter` never sees a
+rule. What it asserts instead is the sink-boundary half the recorder depends on —
+each accepted transition recorded exactly once, fields intact, order preserved.
+And for ClickHouse the read half's intelligence is SQL, which no fake connection
+executes: `optional_conformance_test.go` therefore *pins the query text* (a
+statement missing a load-bearing clause is refused, never answered on the old
+understanding) and evaluates the intended semantics over the rows the writer
+really inserted, while `make test-integration` is what proves those clauses mean
+in ClickHouse what the stand-in assumes.
+
 ## Integration tests — `make test-integration`
 
 Two suites run against a real, dockerized ClickHouse (build tag `integration`),

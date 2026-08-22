@@ -165,19 +165,11 @@ func TestProbeClassifiesOutcomes(t *testing.T) {
 			wantInMessage: []string{"ping", "connection refused"},
 		},
 		{
-			name: "a drifted schema is classified as a schema failure",
-			conn: func() fakeProbeConn {
-				rows := fullSchemaRows()
-				for i := range rows {
-					if rows[i][0] == tableResourceStates && rows[i][1] == "sha256" {
-						rows[i][2] = "FixedString(64)"
-					}
-				}
-				return fakeProbeConn{rows: rows}
-			}(),
+			name:           "a drifted schema is classified as a schema failure",
+			conn:           fakeProbeConn{rows: driftedSchemaRows()},
 			wantErr:        true,
 			wantSchemaKind: true,
-			wantInMessage:  []string{"sha256", "FixedString(64)"},
+			wantInMessage:  []string{driftedColumn, driftedType},
 		},
 		{
 			name:          "a failed introspection is not a schema verdict",
